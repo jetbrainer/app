@@ -98,7 +98,6 @@ func (w DBOption) Apply(s *Service) error {
 	if err != nil {
 		return err
 	}
-
 	s.DB = p
 	return nil
 }

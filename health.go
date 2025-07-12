@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -54,5 +55,31 @@ func AnswerWithJSONError(w http.ResponseWriter, code int) {
 		err = fmt.Errorf("failed to write error response to writer")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+}
+
+type HealthStatus struct {
+	Status    string            `json:"status"`
+	Timestamp time.Time         `json:"timestamp"`
+	Uptime    time.Duration     `json:"uptime"`
+	Services  map[string]string `json:"services"`
+}
+
+func (s *Service) GetHealthStatus() HealthStatus {
+	services := make(map[string]string)
+
+	if s.DB != nil {
+		if s.checkDBAlive() {
+			services["database"] = "healthy"
+		} else {
+			services["database"] = "unhealthy"
+		}
+	}
+
+	return HealthStatus{
+		Status:    "ok",
+		Timestamp: time.Now(),
+		Uptime:    time.Since(s.startTime),
+		Services:  services,
 	}
 }

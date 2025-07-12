@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"sync/atomic"
 	"time"
 
@@ -41,6 +40,8 @@ type Service struct {
 	ErrChan     chan error
 	SubServices map[string]SubService
 	sigHandler  SignalTrap
+	startTime   time.Time
+	version     string
 }
 
 func New(ctx context.Context, name string, options ...Option) (*Service, error) {
@@ -53,6 +54,7 @@ func New(ctx context.Context, name string, options ...Option) (*Service, error) 
 		ctx:         ctx,
 		isReady:     isReady,
 		SubServices: make(map[string]SubService),
+		sigHandler:  TermSignalTrap(),
 	}
 
 	for _, o := range options {
@@ -108,25 +110,22 @@ func (s *Service) IsAlive() bool {
 		isDBAlive = false
 	}
 
-	//isRedisAlive := true
-	//if s.Redis != nil && !s.checkRedisAlive() {
-	//	isRedisAlive = false
-	//}
-
-	return isGrpcAlive && areHTTPServersAlive && isDBAlive // add redis
+	return isGrpcAlive && areHTTPServersAlive && isDBAlive
 }
 
 func (s *Service) Start() error {
+	s.startTime = time.Now()
+	log.Info().Time("start_time", s.startTime).Msg("service starting")
+
 	ctx := s.GetContext()
-	// add trace
 
 	for _, httpServ := range s.HTTPServers {
 		httpServ := httpServ
 		go func() {
-			log.Info().Msgf("started http server address", httpServ.Addr)
+			log.Info().Msgf("started http server address %s", httpServ.Addr)
 			defer log.Info().Msg("stopped http server")
 
-			if err := httpServ.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			if err := httpServ.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				s.ErrChan <- fmt.Errorf("http: failed to serve %v", err)
 			}
 		}()
@@ -136,7 +135,7 @@ func (s *Service) Start() error {
 		grpcServer := grpcServer
 
 		go func() {
-			log.Info().Msgf("started grpc server address", grpcServer.address)
+			log.Info().Msgf("started grpc server address %s", grpcServer.address)
 			defer log.Info().Msg("stopped grpc server")
 
 			listener, err := net.Listen("tcp", grpcServer.address)
@@ -145,7 +144,7 @@ func (s *Service) Start() error {
 				return
 			}
 
-			if err = grpcServer.server.Serve(listener); err != nil && err != grpc.ErrServerStopped {
+			if err = grpcServer.server.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 				s.ErrChan <- fmt.Errorf("grpc: failed to serve %v", err)
 			}
 		}()
@@ -154,23 +153,34 @@ func (s *Service) Start() error {
 	go s.Ready()
 
 	{
-		if err := s.sigHandler.Wait(ctx); err != nil && err != ErrTermSig {
-			log.Error().Msgf("failed to caught signal", log.Err(err))
+		if err := s.sigHandler.Wait(ctx); err != nil && !errors.Is(err, ErrTermSig) {
+			log.Error().Msgf("failed to caught signal %v", log.Err(err))
 			return err
 		}
 		log.Info().Msg("termination signal received")
 	}
 
+	go func() {
+		for err := range s.ErrChan {
+			log.Error().Err(err).Msg("service error occurred")
+		}
+	}()
+
 	return nil
 }
 
 func (s *Service) Stop() {
+	log.Info().Msg("initiating graceful shutdown...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	for _, service := range s.SubServices {
 		if err := service.Close(); err != nil {
-			log.Error().Msgf("failed to stop service service %s", service.Name())
+			log.Error().Err(err).Str("service", service.Name()).Msg("failed to stop service")
+		} else {
+			log.Debug().Str("service", service.Name()).Msg("subservice stopped")
 		}
-
-		log.Debug().Msgf("subservice stopped subservice %s", service.Name())
 	}
 
 	for _, grpcServer := range s.GRPCServers {
@@ -179,29 +189,21 @@ func (s *Service) Stop() {
 	}
 
 	for _, httpServer := range s.HTTPServers {
-		if err := httpServer.Shutdown(s.ctx); err != nil {
-			log.Error().Msgf("failed to shutdown http server %s", httpServer.Addr)
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Error().Err(err).Str("addr", httpServer.Addr).Msg("failed to shutdown http server")
+		} else {
+			log.Debug().Str("addr", httpServer.Addr).Msg("http server stopped")
 		}
-		log.Debug().Msg("http server stopped")
 	}
 
 	if s.DB != nil {
-		if err := s.DB.Close(); err != nil {
-			log.Error().Msg("failed to close connection to db")
-		}
-
-		log.Debug().Msg("db stopped")
+		s.DB.Close()
+		log.Debug().Msg("db connection closed")
 	}
 
-	//if s.Redis != nil {
-	//	if err := s.Redis.Close(); err != nil {
-	//		log.Error().Msg( "failed to close connection to redis")
-	//	}
-	//
-	//	log.Debug().Msg("redis stopped")
-	//}
+	close(s.ErrChan)
 
-	os.Exit(1)
+	log.Info().Msg("graceful shutdown completed")
 }
 
 func (s *Service) Ready() {
@@ -234,11 +236,6 @@ func (s *Service) Ready() {
 		isDBReady = false
 	}
 
-	//isRedisAlive := true
-	//if s.Redis != nil && !s.checkRedisAlive() {
-	//	isRedisAlive = false
-	//}
-
 	s.isReady.Swap(areSubServicesReady && isGRPCReady && areHTTPServersReady && isDBReady)
 }
 func (s *Service) checkHTTPServerUp(httpServer *http.Server) bool {
@@ -259,7 +256,6 @@ func (s *Service) checkHTTPServerUp(httpServer *http.Server) bool {
 }
 
 func (s *Service) checkGRPCServerUp() bool {
-	ctx := s.GetContext()
 	var conn *grpc.ClientConn
 	defer func() {
 		if conn != nil {
@@ -269,8 +265,7 @@ func (s *Service) checkGRPCServerUp() bool {
 
 	for _, server := range s.GRPCServers {
 		var err error
-		// WithBlock will block dial until the server is ready
-		if conn, err = grpc.DialContext(ctx, server.address, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock()); err != nil {
+		if conn, err = grpc.NewClient(server.address, grpc.WithTransportCredentials(insecure.NewCredentials())); err != nil {
 			log.Debug().Msg(err.Error())
 			return false
 		}
@@ -281,15 +276,18 @@ func (s *Service) checkGRPCServerUp() bool {
 }
 
 func (s *Service) checkDBAlive() bool {
-	//err := s.DB.Ping(s.ctx)
-	//if err != nil {
-	//	log.Debug().Msgf(s.ctx, "db is not ready", log.Err(err))
-	//}
-	//ready := err == nil
-	//
-	log.Debug().Msg("db is ready")
+	if s.DB == nil {
+		return true
+	}
 
-	return false
+	err := s.DB.Ping(s.ctx)
+	if err != nil {
+		log.Debug().Err(err).Msg("db is not ready")
+		return false
+	}
+
+	log.Debug().Msg("db is ready")
+	return true
 }
 
 func (s *Service) checkRedisAlive() bool {
