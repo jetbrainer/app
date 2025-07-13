@@ -2,15 +2,20 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/pprof"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/tracelog"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
 )
 
@@ -94,10 +99,30 @@ func (w DBOption) Apply(s *Service) error {
 		return err
 	}
 
+	l := &zerolog.Logger{}
+
+	m := MultiQueryTracer{
+		Tracers: []pgx.QueryTracer{
+			otelpgx.NewTracer(),
+
+			&tracelog.TraceLog{
+				Logger:   NewLogger(l),
+				LogLevel: tracelog.LogLevelTrace,
+			},
+		},
+	}
+
+	poolConfig.ConnConfig.Tracer = &m
+
 	p, err := pgxpool.NewWithConfig(context.Background(), poolConfig)
 	if err != nil {
 		return err
 	}
+
+	if err := otelpgx.RecordStats(p); err != nil {
+		return fmt.Errorf("unable to record database stats: %w", err)
+	}
+
 	s.DB = p
 	return nil
 }
